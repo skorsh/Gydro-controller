@@ -1,0 +1,877 @@
+// Gydro controller v1.1
+// Стабільна версія
+// Оновлення по ОТА
+// Модифікований дизайн веб сторінки
+// Відображення статусу живлення
+// Gydro controller v1.2:
+// http://gydro.local/
+// Виправлена логіка керування насосами.
+
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#include <WiFiUdp.h>
+#include <NTPClient.h>
+#include <EEPROM.h>
+#include <Wire.h>
+#include <Adafruit_BMP280.h>
+#include <TimeLib.h>
+#include <ArduinoJson.h>
+#include <ESP8266httpUpdate.h>
+#include <ESP8266HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include <ESP8266mDNS.h>
+
+
+// Налаштування WiFi
+const char* ssid = "TP-LINK_7BB2";
+const char* password = "Hodapu99";
+IPAddress staticIP(192, 168, 0, 173);
+IPAddress gateway(192, 168, 0, 1);
+IPAddress subnet(255, 255, 255, 0);
+IPAddress dns1(8, 8, 8, 8);
+IPAddress dns2(8, 8, 4, 4);
+
+// Назва пристрою
+const char* deviceName = "Gydro controller";
+
+// Піни для реле
+const int LIGHT_RELAY_PIN = D3;   // Реле освітлення IN1
+const int PUMP_RELAY_PIN = D4;    // Реле насосу IN2
+const int BACKUP_POWER_RELAY = D5;  // АКБ IN3
+const int BACKUP_POWER_PUMP = D6;   // Насосу резервного живлення IN4
+const int POWER_MONITOR_PIN = A0;   // Пін для моніторингу напруги (A0)
+#define I2C_SDA D2  // GPIO4
+#define I2C_SCL D1  // GPIO5
+
+// Можливі адреси BMP280
+const byte BMP280_ADDRESSES[] = {0x76, 0x77};
+const int NUM_ADDRESSES = sizeof(BMP280_ADDRESSES);
+// Глобальні змінні
+Adafruit_BMP280 bmp;
+bool bmpFound = false;
+byte bmpAddress = 0x00;
+
+// Налаштування NTP
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, "pool.ntp.org", 2 * 3600, 60000); // Київський час (+2 години)
+
+// Веб-сервер
+ESP8266WebServer server(80);
+
+// Структура для налаштувань
+struct Settings {
+  // Освітлення
+  int lightPeriod1Start;
+  int lightPeriod1End;
+  int lightPeriod2Start;
+  int lightPeriod2End;
+
+  // Насос (тепер в хвилинах)
+  int pumpDayWorkDuration;
+  int pumpDayStopDuration;
+  int pumpNightWorkDuration;
+  int pumpNightStopDuration;
+};
+
+// Глобальні змінні
+Settings currentSettings;
+bool lightStatus = false;
+bool pumpStatus = false;
+float temperature = 0.0;
+float pressure = 0.0;
+bool isBackupPower = false; // Змінна для зберігання стану живлення
+bool previousPowerState = false; // Додано змінну для попереднього стану
+bool voltageLogged = false; // Нова змінна для відстеження виводу напруги
+// *** ОГОЛОШЕННЯ ЗМІННИХ ***
+unsigned long lastPowerCheckTime = 0;
+const unsigned long powerCheckInterval = 5000; // Перевірка кожні 5 секунд
+
+// *** ПРОТОТИПИ ФУНКЦІЙ (forward declarations) ***
+void handleRoot();
+void handleGetConfig();
+void handleSaveConfig();
+void handleUpdate();
+void checkForUpdates();
+
+void checkPowerStatus() {
+  int analogValue = analogRead(POWER_MONITOR_PIN);
+  float voltage = analogValue * (3.3 / 1023.0) * 4.125; // Коефіцієнт потрібно відкоригувати!
+
+  // Виводимо напругу лише один раз при кожній перевірці
+  if (!voltageLogged) {
+    Serial.print("Напруга живлення: ");
+    Serial.println(voltage);
+    voltageLogged = true; // Встановлюємо флаг, що напруга вже виведена
+  }
+
+  isBackupPower = (voltage < 10.0); // Спрощений запис умови
+
+  // Перевірка зміни стану живлення
+  if (isBackupPower != previousPowerState) {
+    if (isBackupPower) {
+      Serial.println("Перехід на резервне живлення");
+    } else {
+      Serial.println("Робота від основного живлення");
+    }
+    previousPowerState = isBackupPower; // Оновлюємо попередній стан
+  }
+
+  setRelayState();
+}
+
+void setRelayState() {
+    digitalWrite(BACKUP_POWER_RELAY, !isBackupPower); // Вмикаємо/вимикаємо реле резервного живлення
+    // Ця функція лише встановлює, який насос активний, але не керує його станом за часом
+}
+
+void controlPump() {
+    static bool previousIsBackupPower = isBackupPower; // Запам'ятовуємо попередній стан живлення
+    static unsigned long pumpStartTime = 0;
+    static unsigned long pumpStopTime = 0;
+    static bool pumpRunning = false;
+
+    // *** ДОДАНО ЦЕЙ БЛОК ***
+    if (isBackupPower != previousIsBackupPower) { // Перевірка зміни режиму живлення
+        digitalWrite(PUMP_RELAY_PIN, LOW);       // Вимикаємо основний насос
+        digitalWrite(BACKUP_POWER_PUMP, LOW);   // Вимикаємо резервний насос
+        pumpRunning = false;                    // Скидаємо стан роботи насоса
+        pumpStopTime = millis();                // Оновлюємо час зупинки
+        Serial.println("Режим живлення змінено. Обидва насоси вимкнено.");
+        previousIsBackupPower = isBackupPower;   // Оновлюємо попередній стан живлення
+    }
+
+    int currentHour = timeClient.getHours();
+    bool isDayPeriod = (currentHour >= 8);
+
+    unsigned long currentMillis = millis();
+
+    int workDuration = (isDayPeriod ? currentSettings.pumpDayWorkDuration : currentSettings.pumpNightWorkDuration) * 60;
+    int stopDuration = (isDayPeriod ? currentSettings.pumpDayStopDuration : currentSettings.pumpNightStopDuration) * 60;
+
+    int pumpRelayPin = isBackupPower ? BACKUP_POWER_PUMP : PUMP_RELAY_PIN;
+
+    if (!pumpRunning && (currentMillis - pumpStopTime >= stopDuration * 1000)) {
+        digitalWrite(pumpRelayPin, HIGH);
+        pumpRunning = true;
+        pumpStartTime = currentMillis;
+        pumpStatus = true;
+        Serial.print("Насос увімкнено (");
+        Serial.print(isBackupPower ? "резервне живлення" : "основне живлення");
+        Serial.println(")");
+    }
+
+    if (pumpRunning && (currentMillis - pumpStartTime >= workDuration * 1000)) {
+        digitalWrite(pumpRelayPin, LOW);
+        pumpRunning = false;
+        pumpStopTime = currentMillis;
+        pumpStatus = false;
+        Serial.print("Насос вимкнено (");
+        Serial.print(isBackupPower ? "резервне живлення" : "основне живлення");
+        Serial.println(")");
+    }
+}
+
+void setupWiFi() {
+  // Встановлення статичної IP-адреси
+  WiFi.config(staticIP, gateway, subnet, dns1, dns2);
+  
+  // Встановлення імені пристрою
+  WiFi.hostname(deviceName);
+  
+  // Підключення до WiFi
+  WiFi.begin(ssid, password);
+  
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+  
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("\nНе вдалося підключитися до WiFi. Перезавантаження.");
+    ESP.restart();
+  }
+  
+  Serial.println("\nПідключено до WiFi");
+  Serial.print("IP-адреса: ");
+  Serial.println(WiFi.localIP());
+}
+
+void diagnoseI2C() {
+  Serial.println("\n=== Діагностика I2C ===");
+  
+  // Перевірка підключення ліній SDA та SCL
+  pinMode(I2C_SDA, INPUT_PULLUP);
+  pinMode(I2C_SCL, INPUT_PULLUP);
+  
+  Serial.print("Стан лінії SDA (D2): ");
+  Serial.println(digitalRead(I2C_SDA) == HIGH ? "HIGH (підтягнута)" : "LOW");
+  
+  Serial.print("Стан лінії SCL (D1): ");
+  Serial.println(digitalRead(I2C_SCL) == HIGH ? "HIGH (підтягнута)" : "LOW");
+
+  // Сканування I2C пристроїв
+  Serial.println("\nСканування I2C пристроїв:");
+  
+  Wire.begin(I2C_SDA, I2C_SCL);
+  Wire.setClock(100000);  // Стандартна швидкість I2C
+  
+  int nDevices = 0;
+  for(byte address = 1; address < 127; address++ ) {
+    Wire.beginTransmission(address);
+    byte error = Wire.endTransmission();
+    
+    if (error == 0) {
+      Serial.print("I2C пристрій знайдено за адресою: 0x");
+      if (address < 16) Serial.print("0");
+      Serial.println(address, HEX);
+      nDevices++;
+    }
+    else if (error == 4) {
+      Serial.print("Невідома помилка при адресі: 0x");
+      if (address < 16) Serial.print("0");
+      Serial.println(address, HEX);
+    }    
+  }
+  
+  if (nDevices == 0)
+    Serial.println("Жодного I2C пристрою не знайдено!");
+  else
+    Serial.printf("Знайдено %d I2C пристроїв\n", nDevices);
+}
+
+bool initBMP280() {
+  Serial.println("\n=== Ініціалізація BMP280 ===");
+  
+  Wire.begin(I2C_SDA, I2C_SCL);
+  Wire.setClock(100000);  // Стандартна швидкість I2C
+  delay(100);             // Затримка перед ініціалізацією
+
+  for (int i = 0; i < NUM_ADDRESSES; i++) {
+    if (bmp.begin(BMP280_ADDRESSES[i])) {
+      bmpFound = true;
+      bmpAddress = BMP280_ADDRESSES[i];
+      Serial.printf("BMP280 знайдено за адресою: 0x%02X\n", bmpAddress);
+      return true;
+    }
+  }
+
+  Serial.println("Не вдалося ініціалізувати BMP280. Перевірте підключення.");
+  return false;
+}
+  
+void updateSensorData() {
+  static unsigned long lastSensorUpdate = 0;
+  static byte errorCount = 0;
+
+  if (millis() - lastSensorUpdate >= 60000) {
+    float tempRead = bmp.readTemperature();
+    float pressRead = bmp.readPressure() / 100.0;
+
+    if (tempRead > -50 && tempRead < 100 &&
+        pressRead > 800 && pressRead < 1200) {
+      temperature = tempRead;
+      pressure = pressRead;
+
+      Serial.print("Оновлено дані: ");
+      Serial.print(temperature, 1);
+      Serial.print("°C, ");
+      Serial.print(pressure, 1);
+      Serial.println(" гПа");
+
+      errorCount = 0;
+    } else {
+      Serial.println("Некоректні дані від датчика");
+      errorCount++;
+    }
+
+    if (errorCount > 5) {
+      Serial.println("Критична помилка датчика. Перезапуск.");
+      ESP.restart();
+    }
+
+    lastSensorUpdate = millis();
+  }
+}
+
+void controlLighting() {
+  // Поточний час
+  int currentHour = timeClient.getHours();
+  int currentMinute = timeClient.getMinutes();
+  
+  // Перетворення часу в хвилини для простішого порівняння
+  int currentTimeInMinutes = currentHour * 60 + currentMinute;
+  
+  // Перевірка першого періоду освітлення
+  bool inFirstLightPeriod = 
+    currentTimeInMinutes >= currentSettings.lightPeriod1Start &&
+    currentTimeInMinutes < currentSettings.lightPeriod1End;
+  
+  // Перевірка другого періоду освітлення
+  bool inSecondLightPeriod = 
+    currentTimeInMinutes >= currentSettings.lightPeriod2Start &&
+    currentTimeInMinutes < currentSettings.lightPeriod2End;
+  
+  // Встановлення статусу реле освітлення
+  lightStatus = inFirstLightPeriod || inSecondLightPeriod;
+  digitalWrite(LIGHT_RELAY_PIN, lightStatus ? HIGH : LOW);
+  
+  // Логування змін
+  static bool lastLightStatus = !lightStatus;
+  if (lightStatus != lastLightStatus) {
+    Serial.print("Статус освітлення: ");
+    Serial.println(lightStatus ? "Увімкнено" : "Вимкнено");
+    lastLightStatus = lightStatus;
+  }
+}
+
+void loadSettingsFromEEPROM() {
+  // Завантаження налаштувань з EEPROM
+  EEPROM.get(0, currentSettings);
+
+  // Перевірка коректності налаштувань (додано перевірку pumpDayWorkDuration)
+  if (currentSettings.lightPeriod1Start < 0 || currentSettings.lightPeriod1Start > 1440 ||
+      currentSettings.pumpDayWorkDuration <= 0) { // Нова умова
+
+    // Встановлення тестових значень за замовчуванням (в хвилинах!)
+    currentSettings.lightPeriod1Start = 360;  // 6:00
+    currentSettings.lightPeriod1End = 720;    // 12:00
+    currentSettings.lightPeriod2Start = 1080; // 18:00
+    currentSettings.lightPeriod2End = 1440;   // 24:00
+
+    currentSettings.pumpDayWorkDuration = 5;    // 5 хвилин
+    currentSettings.pumpDayStopDuration = 10;   // 10 хвилин
+    currentSettings.pumpNightWorkDuration = 3;  // 3 хвилини
+    currentSettings.pumpNightStopDuration = 15; // 15 хвилин
+
+    // Збереження тестових налаштувань
+    EEPROM.put(0, currentSettings);
+    EEPROM.commit();
+
+    Serial.println("Завантажено тестові налаштування");
+  }
+
+  Serial.println("Налаштування успішно завантажено з EEPROM");
+}
+
+void setupWebServer() {
+  // Налаштування маршрутів
+  server.on("/", handleRoot);
+  server.on("/getconfig", handleGetConfig);
+  server.on("/saveconfig", HTTP_POST, handleSaveConfig);
+  server.on("/update", handleUpdate);
+  
+  // Запуск сервера
+  server.begin();
+  Serial.println("HTTP сервер запущено");
+}
+
+void handleRoot() {
+  String html = R"(
+<!DOCTYPE html>
+<html lang='uk'>
+<head>
+    <meta charset='UTF-8'>
+    <title>Hydro Controller</title>
+    <meta name='viewport' content='width=device-width, initial-scale=1'>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/tailwindcss/2.2.19/tailwind.min.css" rel="stylesheet">
+    <style>
+        body {
+            font-size: 16px;
+            -webkit-text-size-adjust: 100%;
+        }
+        
+        .card {
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+            padding: 1rem;
+            margin-bottom: 1rem;
+            width: 100%;
+        }
+        
+        .status-badge {
+            padding: 0.25rem 0.75rem;
+            border-radius: 9999px;
+            font-size: 0.875rem;
+            font-weight: 500;
+            display: inline-block;
+            margin-top: 0.25rem;
+        }
+        
+        .status-on {
+            background-color: #DEF7EC;
+            color: #03543F;
+        }
+        
+        .status-off {
+            background-color: #FDE8E8;
+            color: #9B1C1C;
+        }
+        
+        input[type="time"],
+        input[type="number"] {
+            width: 100%;
+            padding: 0.75rem;
+            border: 1px solid #E2E8F0;
+            border-radius: 0.375rem;
+            margin: 0.5rem 0;
+            font-size: 1rem;
+            -webkit-appearance: none;
+        }
+        
+        /* Збільшуємо розмір тап-зони для мобільних */
+        button {
+            background-color: #2563EB;
+            color: white;
+            padding: 1rem;
+            border-radius: 0.375rem;
+            font-weight: 500;
+            width: 100%;
+            min-height: 3rem;
+            margin: 0.5rem 0;
+            font-size: 1rem;
+            touch-action: manipulation;
+        }
+        
+        button:active {
+            background-color: #1D4ED8;
+            transform: translateY(1px);
+        }
+        
+        /* Стилі для iOS */
+        @supports (-webkit-touch-callout: none) {
+            input[type="time"],
+            input[type="number"] {
+                font-size: 16px;
+            }
+            
+            select {
+                font-size: 16px;
+                padding: 0.5rem;
+            }
+        }
+        
+        /* Покращення для маленьких екранів */
+        @media (max-width: 640px) {
+            .card {
+                padding: 0.875rem;
+            }
+            
+            h1 {
+                font-size: 1.5rem !important;
+                margin-bottom: 1rem !important;
+            }
+            
+            h2 {
+                font-size: 1.25rem !important;
+                margin-bottom: 0.75rem !important;
+            }
+            
+            .grid {
+                gap: 0.75rem !important;
+            }
+            
+            .value-display {
+                display: block;
+                margin-top: 0.25rem;
+            }
+        }
+    </style>
+</head>
+<body class="bg-gray-50 min-h-screen p-3">
+    <div class="max-w-lg mx-auto">
+        <h1 class="text-2xl font-bold text-gray-900 mb-4">Hydro Controller</h1>
+           
+        <div class="card">
+            <h2 class="text-lg font-semibold text-gray-800 mb-3">Інформація про систему</h2>
+            <div class="space-y-3">
+                <div class="grid grid-cols-2 gap-2">
+                    <div>
+                        <p class="text-gray-600">Дата:
+                            <span id='currentDate' class="block text-gray-900 font-medium">-</span>
+                        </p>
+                    </div>
+                    <div>
+                        <p class="text-gray-600">Час:
+                            <span id='currentTime' class="block text-gray-900 font-medium">-</span>
+                        </p>
+                    </div>
+                </div>
+                <div class="grid grid-cols-2 gap-2">
+                    <div>
+                        <p class="text-gray-600">Температура:
+                            <span id='temperature' class="block text-gray-900 font-medium">-</span>°C
+                        </p>
+                    </div>
+                    <div>
+                        <p class="text-gray-600">Тиск:
+                            <span id='pressure' class="block text-gray-900 font-medium">-</span> гПа
+                        </p>
+                    </div>
+                </div>
+                <div class="grid grid-cols-3 gap-2">
+                    <div>
+                        <p class="text-gray-600">Освітлення:
+                            <span id='lightStatus' class="status-badge">-</span>
+                        </p>
+                    </div>
+                    <div>
+                        <p class="text-gray-600">Насос:
+                            <span id='pumpStatus' class="status-badge">-</span>
+                        </p>
+                    </div>
+                    <div>
+                        <p class="text-gray-600">Power:
+                            <span id='powerStatus' class="status-badge">-</span>
+                        </p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2 class="text-lg font-semibold text-gray-800 mb-3">Керування освітленням</h2>
+            <div class="space-y-4">
+                <div>
+                    <label class="block text-gray-700 mb-2">Перший період</label>
+                    <div class="grid grid-cols-2 gap-2">
+                        <input type='time' id='lightPeriod1Start' class="touch-manipulation">
+                        <input type='time' id='lightPeriod1End' class="touch-manipulation">
+                    </div>
+                </div>
+                <div>
+                    <label class="block text-gray-700 mb-2">Другий період</label>
+                    <div class="grid grid-cols-2 gap-2">
+                        <input type='time' id='lightPeriod2Start' class="touch-manipulation">
+                        <input type='time' id='lightPeriod2End' class="touch-manipulation">
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2 class="text-lg font-semibold text-gray-800 mb-3">Керування насосом</h2>
+            <div class="space-y-4">
+                <div>
+                    <label class="block text-gray-700 mb-2">Денний період (хв)</label>
+                    <div class="grid grid-cols-2 gap-2">
+                        <input type='number' id='pumpDayWorkDuration' placeholder='Робота' class="touch-manipulation">
+                        <input type='number' id='pumpDayStopDuration' placeholder='Пауза' class="touch-manipulation">
+                    </div>
+                </div>
+                <div>
+                    <label class="block text-gray-700 mb-2">Нічний період (хв)</label>
+                    <div class="grid grid-cols-2 gap-2">
+                        <input type='number' id='pumpNightWorkDuration' placeholder='Робота' class="touch-manipulation">
+                        <input type='number' id='pumpNightStopDuration' placeholder='Пауза' class="touch-manipulation">
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <button onclick='saveConfig()' class="save-button">Зберегти налаштування</button>
+        <div id='saveResult' class="text-center my-2 font-medium"></div>
+        <button onclick="window.location.href='/update'" class="bg-gray-600 hover:bg-gray-700">Оновити прошивку</button>
+    </div>
+
+    <script>
+        function loadConfig() {
+            fetch('/getconfig')
+                .then(response => response.json())
+                .then(data => {
+                    document.getElementById('lightPeriod1Start').value = minutesToTime(data.lightPeriod1Start);
+                    document.getElementById('lightPeriod1End').value = minutesToTime(data.lightPeriod1End);
+                    document.getElementById('lightPeriod2Start').value = minutesToTime(data.lightPeriod2Start);
+                    document.getElementById('lightPeriod2End').value = minutesToTime(data.lightPeriod2End);
+
+                    document.getElementById('pumpDayWorkDuration').value = data.pumpDayWorkDuration;
+                    document.getElementById('pumpDayStopDuration').value = data.pumpDayStopDuration;
+                    document.getElementById('pumpNightWorkDuration').value = data.pumpNightWorkDuration;
+                    document.getElementById('pumpNightStopDuration').value = data.pumpNightStopDuration;
+                })
+                .catch(error => console.error('Помилка завантаження:', error));
+            updateSystemInfo();
+        }
+
+function updateSystemInfo() {
+            fetch('/getconfig')
+                .then(response => response.json())
+                .then(data => {
+                    document.getElementById('temperature').textContent = data.temperature.toFixed(1);
+                    document.getElementById('pressure').textContent = data.pressure.toFixed(1);
+                    
+                    const lightStatus = document.getElementById('lightStatus');
+                    lightStatus.textContent = data.lightStatus ? 'Увімк.' : 'Вимк.';
+                    lightStatus.className = 'status-badge ' + (data.lightStatus ? 'status-on' : 'status-off');
+                    
+                    const pumpStatus = document.getElementById('pumpStatus');
+                    pumpStatus.textContent = data.pumpStatus ? 'Увімк.' : 'Вимк.';
+                    pumpStatus.className = 'status-badge ' + (data.pumpStatus ? 'status-on' : 'status-off');
+
+                    const powerStatus = document.getElementById('powerStatus');
+                    powerStatus.textContent = data.powerStatus ? 'АКБ' : 'Осн.';
+                    powerStatus.className = 'status-badge ' + (data.powerStatus ? 'status-on' : 'status-off');
+
+                    const now = new Date();
+                    document.getElementById('currentDate').textContent = now.toLocaleDateString('uk-UA');
+                    document.getElementById('currentTime').textContent = now.toLocaleTimeString('uk-UA');
+                });
+        }
+
+
+        function minutesToTime(minutes) {
+            const hours = Math.floor(minutes / 60);
+            const mins = minutes % 60;
+            return `${hours.toString().padStart(2, '0')}:${mins.toString().padStart(2, '0')}`;
+        }
+
+        function timeToMinutes(time) {
+            const [hours, minutes] = time.split(':').map(Number);
+            return hours * 60 + minutes;
+        }
+
+        function saveConfig() {
+            const config = {
+                lightPeriod1Start: timeToMinutes(document.getElementById('lightPeriod1Start').value),
+                lightPeriod1End: timeToMinutes(document.getElementById('lightPeriod1End').value),
+                lightPeriod2Start: timeToMinutes(document.getElementById('lightPeriod2Start').value),
+                lightPeriod2End: timeToMinutes(document.getElementById('lightPeriod2End').value),
+                pumpDayWorkDuration: Number(document.getElementById('pumpDayWorkDuration').value),
+                pumpDayStopDuration: Number(document.getElementById('pumpDayStopDuration').value),
+                pumpNightWorkDuration: Number(document.getElementById('pumpNightWorkDuration').value),
+                pumpNightStopDuration: Number(document.getElementById('pumpNightStopDuration').value)
+            };
+
+            fetch('/saveconfig', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(config)
+            })
+            .then(response => response.json())
+            .then(data => {
+                const resultDiv = document.getElementById('saveResult');
+                resultDiv.textContent = data.status;
+                resultDiv.className = data.status === 'Налаштування збережено' ? 'text-green-600' : 'text-red-600';
+                loadConfig();
+            })
+            .catch(error => console.error('Помилка:', error));
+        }
+
+        window.onload = loadConfig;
+        setInterval(updateSystemInfo, 60000);
+    </script>
+</body>
+</html>
+)";
+
+  server.send(200, "text/html", html);
+}
+
+void handleGetConfig() {
+  StaticJsonDocument<1024> jsonDoc;
+  
+    // Системна інформація
+  if (isnan(temperature) || isinf(temperature)) {
+    jsonDoc["temperature"] = "Помилка зчитування"; // Або інше повідомлення
+  } else {
+    jsonDoc["temperature"] = temperature;
+  }
+
+  if (isnan(pressure) || isinf(pressure)) {
+    jsonDoc["pressure"] = "Помилка зчитування"; // Або інше повідомлення
+  } else {
+    jsonDoc["pressure"] = pressure;
+  }
+
+  // Налаштування освітлення
+  jsonDoc["lightPeriod1Start"] = currentSettings.lightPeriod1Start;
+  jsonDoc["lightPeriod1End"] = currentSettings.lightPeriod1End;
+  jsonDoc["lightPeriod2Start"] = currentSettings.lightPeriod2Start;
+  jsonDoc["lightPeriod2End"] = currentSettings.lightPeriod2End;
+
+  // Налаштування насосу
+  jsonDoc["pumpDayWorkDuration"] = currentSettings.pumpDayWorkDuration;
+  jsonDoc["pumpDayStopDuration"] = currentSettings.pumpDayStopDuration;
+  jsonDoc["pumpNightWorkDuration"] = currentSettings.pumpNightWorkDuration;
+  jsonDoc["pumpNightStopDuration"] = currentSettings.pumpNightStopDuration;
+
+  // *** ДОДАНО ЦІ РЯДКИ ***
+  jsonDoc["lightStatus"] = lightStatus;
+  jsonDoc["pumpStatus"] = pumpStatus;
+  jsonDoc["isBackupPower"] = isBackupPower; // Додаємо статус живлення
+  jsonDoc["activePump"] = isBackupPower ? "Резервний" : "Основний"; // Додаємо інформацію про активний насос
+
+  // Поточний час
+  jsonDoc["currentTime"] = timeClient.getFormattedTime();
+
+  String jsonResponse;
+  serializeJson(jsonDoc, jsonResponse);
+  server.send(200, "application/json", jsonResponse);
+}
+
+void handleSaveConfig() {
+  StaticJsonDocument<512> jsonDoc;
+  DeserializationError error = deserializeJson(jsonDoc, server.arg("plain"));
+
+  if (error) {
+    server.send(400, "application/json", "{\"status\":\"Некоректні дані\"}");
+    return;
+  }
+
+  // Перевірка та збереження налаштувань освітлення
+  currentSettings.lightPeriod1Start = jsonDoc["lightPeriod1Start"].as<int>();
+  currentSettings.lightPeriod1End = jsonDoc["lightPeriod1End"].as<int>();
+  currentSettings.lightPeriod2Start = jsonDoc["lightPeriod2Start"].as<int>();
+  currentSettings.lightPeriod2End = jsonDoc["lightPeriod2End"].as<int>();
+
+  // Перевірка та збереження налаштувань насосу
+  currentSettings.pumpDayWorkDuration = jsonDoc["pumpDayWorkDuration"].as<int>();
+  currentSettings.pumpDayStopDuration = jsonDoc["pumpDayStopDuration"].as<int>();
+  currentSettings.pumpNightWorkDuration = jsonDoc["pumpNightWorkDuration"].as<int>();
+  currentSettings.pumpNightStopDuration = jsonDoc["pumpNightStopDuration"].as<int>();
+
+  // Збереження в EEPROM
+  EEPROM.put(0, currentSettings);
+  EEPROM.commit();
+
+  // Логування змін
+  Serial.println("Нові налаштування збережено в EEPROM");
+
+  server.send(200, "application/json", "{\"status\":\"Налаштування збережено\"}");
+}
+
+void handleUpdate() {
+  Serial.println("Запит на оновлення отримано.");
+  server.sendHeader("Content-Type", "text/plain; charset=UTF-8"); // Додано цей рядок
+  server.send(200, "text/plain", "Оновлення запущено. Перевірте Serial Monitor.");
+  checkForUpdates();
+}
+
+void checkForUpdates() {
+  Serial.println("Перевірка оновлень...");
+
+  WiFiClient client; // Використовуємо WiFiClient (для HTTP)
+  HTTPClient http;
+  String firmwareURL = "http://192.168.0.110/Gydro_control.ino.bin"; // *** HTTP URL ***
+
+    String host = firmwareURL.substring(firmwareURL.indexOf("//") + 2);
+  int slashIndex = host.indexOf("/");
+  String path = "/";
+  if (slashIndex > 0) {
+    path = host.substring(slashIndex);
+    host = host.substring(0, slashIndex);
+  }
+
+  Serial.print("Host: ");
+  Serial.println(host);
+  Serial.print("Path: ");
+  Serial.println(path);
+
+  http.begin(client, host, 80, path); // Використовуємо порт 80 для HTTP
+  http.setUserAgent("ESP8266-http-Update");
+
+  delay(1000);
+
+  t_httpUpdate_return ret = ESPhttpUpdate.update(http);
+
+  switch (ret) {
+    case HTTP_UPDATE_OK:
+      Serial.println("Оновлення успішно завершено. Перезавантаження...");
+      ESP.restart();
+      break;
+    case HTTP_UPDATE_FAILED:
+      Serial.printf("Помилка оновлення: %s\n", ESPhttpUpdate.getLastErrorString().c_str());
+      server.send(500, "text/plain", "Помилка оновлення: " + ESPhttpUpdate.getLastErrorString());
+      break;
+    case HTTP_UPDATE_NO_UPDATES:
+      Serial.println("Оновлень не знайдено.");
+      server.send(200, "text/plain", "Оновлень не знайдено.");
+      break;
+  }
+  http.end();
+}
+
+
+void setup() {
+  Serial.begin(115200);
+  
+  // Ініціалізація EEPROM
+  EEPROM.begin(512);
+  
+  // Налаштування пінів реле
+  pinMode(LIGHT_RELAY_PIN, OUTPUT);
+  pinMode(PUMP_RELAY_PIN, OUTPUT);
+  pinMode(BACKUP_POWER_RELAY, OUTPUT);
+  pinMode(BACKUP_POWER_PUMP, OUTPUT);
+
+  // Ініціалізація моніторингу живлення
+  pinMode(POWER_MONITOR_PIN, INPUT);
+
+  checkPowerStatus(); // Перевірка стану живлення при запуску
+  Serial.println("voltage");
+
+  diagnoseI2C();
+
+  if (!initBMP280()) {
+    Serial.println("Помилка ініціалізації BMP280. Перезавантаження.");
+    delay(5000);
+    //ESP.restart();
+  }
+
+   // Діагностичний код BMP280
+  if (bmpFound) {
+    float temp = bmp.readTemperature();
+    float pres = bmp.readPressure() / 100.0;
+    
+    Serial.print("Температура: ");
+    Serial.print(temp);
+    Serial.print("°C, Тиск: ");
+    Serial.print(pres);
+    Serial.println(" гПа");
+  }
+  
+  // Підключення до WiFi
+  setupWiFi();
+
+  // Ініціалізація mDNS
+    if (MDNS.begin("gydro")) { // "gydro" - це ім'я вашого пристрою
+        Serial.println("mDNS responder started");
+    } else {
+        Serial.println("Error starting mDNS");
+    }
+  
+  // Ініціалізація NTP
+  timeClient.begin();
+  
+  // Завантаження налаштувань
+  loadSettingsFromEEPROM();
+  
+  // Налаштування веб-сервера
+  setupWebServer();
+
+  // Додавання сервісу mDNS (необов'язково, але корисно)
+  MDNS.addService("http", "tcp", 80);
+  Serial.println("HTTP server started");
+
+  server.on("/update", handleUpdate); // Обробник запиту на оновлення
+  //server.begin();
+  Serial.println("Веб-сервер запущено");
+}
+
+void loop() {
+  server.handleClient();
+  timeClient.update();
+
+if (millis() - lastPowerCheckTime >= powerCheckInterval) {
+    checkPowerStatus();
+    lastPowerCheckTime = millis();
+  }
+  
+  // Оновлення параметрів
+  updateSensorData();
+  controlLighting();
+  controlPump();
+
+}
